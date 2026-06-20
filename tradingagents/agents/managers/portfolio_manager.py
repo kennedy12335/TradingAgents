@@ -14,6 +14,7 @@ from tradingagents.agents.schemas import PortfolioDecision, render_pm_decision
 from tradingagents.agents.utils.agent_utils import (
     get_instrument_context_from_state,
     get_language_instruction,
+    get_position_context_from_state,
 )
 from tradingagents.agents.utils.structured import (
     bind_structured,
@@ -26,6 +27,7 @@ def create_portfolio_manager(llm):
 
     def portfolio_manager_node(state) -> dict:
         instrument_context = get_instrument_context_from_state(state)
+        position_context = get_position_context_from_state(state)
 
         history = state["risk_debate_state"]["history"]
         risk_debate_state = state["risk_debate_state"]
@@ -39,9 +41,53 @@ def create_portfolio_manager(llm):
             else ""
         )
 
-        prompt = f"""As the Portfolio Manager, synthesize the risk analysts' debate and deliver the final trading decision.
+        # Re-check mode: when an original_thesis is present, the PM is
+        # judging whether prior reasoning still holds rather than producing
+        # a disconnected fresh analysis. Build the comparison block and the
+        # explicit intact/weakening/broken instruction.
+        original_thesis = state.get("original_thesis", "")
+        if original_thesis:
+            recheck_block = (
+                "\n---\n\n"
+                "**This is a RE-CHECK run, not an initial analysis.**\n\n"
+                f"{original_thesis}\n\n"
+                "Your task is to evaluate whether the original reasoning above "
+                "still holds, given today's fresh analyst debate. Open the "
+                "executive_summary with an explicit classification — one of:\n"
+                "- **Thesis intact** — the original case is still valid; nothing material has changed.\n"
+                "- **Thesis weakening** — parts of the original case are no longer well supported; flag specifically what.\n"
+                "- **Thesis broken** — a load-bearing pillar of the original case has failed; the original reasoning no longer stands.\n\n"
+                "Then state the resulting action against the user's current position "
+                "(e.g. 'thesis intact, sit tight on the existing £800', "
+                "'thesis weakening, trim to £400 while you re-evaluate', "
+                "'thesis broken, exit'). Cite specifically what has changed since the original run.\n"
+            )
+        else:
+            recheck_block = ""
+
+        prompt = f"""As the Portfolio Manager for a retail investor's satellite portfolio, synthesize the risk analysts' debate and deliver the final trading decision.
 
 {instrument_context}
+
+{position_context}
+
+---
+
+**Investor context** (applies to every decision):
+- This is a retail satellite portfolio. Most positions are around £100, occasionally up to ~£2,000 for high-conviction ideas. Speak in £ amounts, never percentages of portfolio or AUM.
+- Long-term orientation: the default hold is months to years, not days. The investor is not trading on technicals or short-term catalysts.
+- The investor maintains a soft ~3-month minimum hold as a personal discipline against reacting to noise. Factor it when framing exit or reduction timing, but it is not a hard rule and does not override the thesis — say what you actually think, and let the investor decide.
+- The investor always makes the final call. Be honest, not hedged: "the thesis is weak, don't initiate" is more useful than a hedged Hold that doesn't steer.
+- The investor is new to finance and reads this both to ACT and to LEARN. Every user-facing field (especially `executive_summary`, `investment_thesis`, `risk_factors`, `rating_rationale`) must be readable by a smart friend who has never traded. Do NOT assume any baseline of investing vocabulary — including the supposedly basic terms: PE, EPS, market cap, dividend yield, support/resistance, beta, bull/bear, drawdown, multiple, margin, free cash flow, guidance. Advanced terms (DCF, EV/EBITDA, PEG, operating leverage, gross-margin compression, insider ratio, short interest, re-rating, catalyst, moat, ATR) must also be glossed.
+
+  **MANDATORY gloss-on-first-use, inline in parentheses, using the real term:**
+  - "...a P/E ratio (price-to-earnings — what you pay for £1 of annual profit) of 28..."
+  - "...trading at $148, near support (a price level the stock has bounced off repeatedly, where buyers tend to step in)..."
+  - "...the moat (durable competitive advantage that makes it hard for rivals to eat the company's lunch) is widening..."
+  - "...free cash flow (cash left over after the business pays for everything it needs to keep running and growing) grew 22%..."
+  - "...we're underweight (own less than we normally would; expressed in £ terms, that means trim toward £400 rather than the usual £800)..."
+
+  After the first gloss in a given output, the term can be used plainly. Do NOT skip the gloss because the term seems obvious — the user explicitly does not have that baseline. Preserve the full analytical depth; just make every term land. The investor should finish reading the decision knowing more than when they started.
 
 ---
 
@@ -52,16 +98,22 @@ def create_portfolio_manager(llm):
 - **Underweight**: Reduce exposure, take partial profits
 - **Sell**: Exit position or avoid entry
 
+---
+
+**Time Horizon** — populate honestly. Either a date-style estimate ("near-term catalyst, resolves within a quarter") or a condition-based answer ("no fixed horizon — hold while gross margins keep expanding; reassess if that reverses") is a complete answer. A condition-based answer is not a fallback; it is the right answer when the thesis is structural. Do not fabricate a date when the thesis does not warrant one.
+
+---
+
 **Context:**
 - Research Manager's investment plan: **{research_plan}**
 - Trader's transaction proposal: **{trader_plan}**
 {lessons_line}
 **Risk Analysts Debate History:**
 {history}
-
+{recheck_block}
 ---
 
-Be decisive and ground every conclusion in specific evidence from the analysts.{get_language_instruction()}"""
+The executive_summary must open by anchoring in the user's actual position status (above). If they hold the name, frame as add / maintain / trim / exit. If they hold nothing, frame as initiate or do-not-initiate. Be decisive and ground every conclusion in specific evidence from the analysts.{get_language_instruction()}"""
 
         final_trade_decision = invoke_structured_or_freetext(
             structured_llm,
